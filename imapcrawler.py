@@ -63,6 +63,22 @@ except ImportError as err:
 
 
 DESCRIPTION = __doc__
+# Precompile regex patterns for better performance
+SPLITTER_PATTERNS = [
+    re.compile(re.escape(s), re.IGNORECASE) for s in [
+        'Mit freundlichen Grüßen',
+        'Viele Grüße',
+        'Best Regards',
+        'Mit freundlichen Gr??en',
+        '***********',
+        '\n--\n',
+        '\n---\n',
+        '\nOHB Digital Connect GmbH\n',
+        '^>.*\n^>.*',
+        '^-----Urspr*\n',
+        '^\s*from\s.*\s*wrote:\s*$',
+    ]
+]
 
 # import questionary
 
@@ -419,24 +435,7 @@ def extract_email(email_id, msg):
     to_recipients = msg.get('To', '')
     cc_recipients = msg.get('Cc', '')
     bcc_recipients = msg.get('Bcc', '')  # Note: Bcc is often not included in fetched emails
-    
-    
-    # Extract attachments
-    # attachments = []
-    # if msg.is_multipart():
-    #     for part in msg.walk():
-    #         if part.get_content_disposition() == 'attachment':
-    #             filename = part.get_filename()
-    #             if filename:
-    #                 # Decode filename if it's encoded
-    #                 decoded_filename = decode_header(filename)[0][0]
-    #                 if isinstance(decoded_filename, bytes):
-    #                     decoded_filename = decoded_filename.decode('utf-8', errors='replace').replace('�', '?')        
-    #                 attachments.append({
-    #                     'filename': decoded_filename,
-    #                     'content_id': part.get('Content-ID', ''),
-    #                     'content_type': part.get_content_type(),
-    #                 })
+
     cleaned_str = msg['Date'].split(', ')[-1].split(' (')[0]  # Only between ', ' and '('
     dt = parser.parse(cleaned_str).astimezone(timezone.utc)
     iso_string = dt.isoformat().replace('+00:00', 'Z')
@@ -492,48 +491,35 @@ def is_valid_attachment(attachment):
         filename.endswith('.ics')
     )
 
-def itersplit(body):
-    lines = body.split('\n')
-    res = []
-    quote_count = 0
+# def itersplit(body):
+#     lines = body.split('\n')
+#     res = []
+#     quote_count = 0
     
-    for line in lines:
-        stripped_line = line.strip()
+#     for line in lines:
+#         stripped_line = line.strip()
         
-        # Check for quote lines
-        if stripped_line.startswith('>'):
-            quote_count += 1
-        else:
-            quote_count = 0
+#         # Check for quote lines
+#         if stripped_line.startswith('>'):
+#             quote_count += 1
+#         else:
+#             quote_count = 0
             
-        # Handle quote removal logic
-        if quote_count > 2 or (
-            stripped_line.lower().startswith('from') and 
-            stripped_line.lower().endswith('wrote:')
-        ):
-            # Remove last two lines if we hit the condition
-            if len(res) >= 2:
-                res = res[:-2]
-            break
+#         # Handle quote removal logic
+#         if quote_count > 2 or (
+#             stripped_line.lower().startswith('from') and 
+#             stripped_line.lower().endswith('wrote:')
+#         ):
+#             # Remove last two lines if we hit the condition
+#             if len(res) >= 2:
+#                 res = res[:-2]
+#             break
             
-        res.append(line)
+#         res.append(line)
     
-    body = '\n'.join(res)
-    return body
+#     body = '\n'.join(res)
+#     return body
 
-# Precompile regex patterns for better performance
-splitter_patterns = [
-    re.compile(re.escape(s), re.IGNORECASE) for s in [
-        'Mit freundlichen Grüßen',
-        'Viele Grüße',
-        'Best Regards',
-        'Mit freundlichen Gr??en',
-        '***********',
-        '\n--\n',
-        '\n---\n',
-        '\nOHB Digital Connect GmbH\n'
-    ]
-]
 
 def clean_record(record):
     body_parts = record.get("body", ["text/plain", "NO_EMAIL_BODY"])
@@ -556,14 +542,17 @@ def clean_record(record):
         body = EmailReplyParser(languages=['en', 'de']).parse_reply(text=body)
     
     # Split by multiple splitters efficiently
-    for pattern in splitter_patterns:
+    for pattern in SPLITTER_PATTERNS:
         body = pattern.split(body)[0]
     
-    # Process lines with optimized logic
-    body = itersplit(body)
+    # # Process lines with optimized logic
+    # body = itersplit(body)
     
     # Final length check
     if len(body) < 50:
+        return {}
+    
+    if body.strip().startswith('Updated invitation: '):
         return {}
     
     # Update the record
@@ -745,12 +734,15 @@ def test_config(config):
 
 def _peek(records, show_body):
     i = random.randrange(0, len(records), 1)
+    print(f'Found N={len(records)=} randomly selected index {i=}')
+    print('\n\n' + '§'*100)
     if show_body:
         print(records[i]['subject'])
         print('')
         print(records[i]['body'])
     else:
         print(json.dumps(records[i], indent=2))
+    print('\n\n' + '§'*100)
 
 def main():
     import argparse
