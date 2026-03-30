@@ -2,7 +2,7 @@
 """
 IMAP Email Inbox Crawler
 Optional dependencies for improved extraction quality can be installed with pip:
-  pip install tqdm beautifulsoup4 python-dateutil mail-parser-reply
+  pip install tqdm beautifulsoup4 python-dateutil mail-parser-reply chromadb
 
 This tool allows you to crawl emails from an IMAP server, 
 fetch raw email data, and clean/parse the content for later analysis and usage for e.G a knowledge base.
@@ -74,9 +74,9 @@ SPLITTER_PATTERNS = [
         '\n--\n',
         '\n---\n',
         '\nOHB Digital Connect GmbH\n',
-        '^>.*\n^>.*',
-        '^-----Urspr*\n',
-        '^\s*from\s.*\s*wrote:\s*$',
+        r'^>.*\n^>.*',
+        r'^-----Urspr*\n',
+        r'^\s*from\s.*\s*wrote:\s*$',
     ]
 ]
 
@@ -91,7 +91,9 @@ DEFAULT_CONFIG = {
         'email': '',
         'mode': 'merge',
         'filepath_raw': 'emails_raw.jsonl',
-        'filepath_clean': 'emails.jsonl'
+        'filepath_clean': 'emails.jsonl',
+        'filepath_vecdb': 'email_vec_db', 
+        'collection_name': 'emails'
     }
     
 def load_config():
@@ -557,8 +559,10 @@ def clean_record(record):
     
     # Update the record
     cleaned_record = copy.deepcopy(record)
-    cleaned_record["body"] = body.strip()
-    
+
+    cleaned_record["content"] = body.strip()
+    cleaned_record.pop('body')
+
     # Optimize list to string conversion
     for k in ['to_list', 'cc_list', 'bcc_list']:
         if isinstance(cleaned_record[k], list):
@@ -660,11 +664,14 @@ def main_get_raw(email, password=None, date=None, month=None, limit=-1, mode='me
     return records
 
 
-def main_get_clean(mode='merge', filepath_clean='emails.jsonl', filepath_raw='emails_raw.jsonl', **kwargs):
+def main_get_clean(mode='merge', filepath_clean='emails.jsonl', filepath_raw='emails_raw.jsonl', limit=-1, **kwargs):
     
     print(f'reading from {filepath_raw=}')
     records = read_records_jsonlines(filepath_raw)
     print(f'got N={len(records)} emails from filepath_raw')
+
+    if limit and limit > 0 and limit < len(records):
+        records = records[:limit]
 
     print('cleaning raw emails...')
     t0 = time.time()
@@ -724,6 +731,87 @@ def main_get_clean(mode='merge', filepath_clean='emails.jsonl', filepath_raw='em
 
 #         cnfg[key] = value
 
+def main_vecdb(filepath_clean:str, filepath_vecdb:str, collection_name:str, limit:int=-1, mode='merge', *args, **kwargs):
+    import chromadb
+
+    pth = str(filepath_clean)
+    with open(pth, 'r') as fp:
+        if pth.endswith('.jsonl'):
+            records = [json.loads(s) for s in fp.readlines()]
+        elif pth.endswith('.json'):
+            records = json.loads(fp.read())
+        else:
+            raise ValueError(f'Unknown file format for {pth=}')
+
+    records = list(records)
+    records = list({r['uid']:r for r in records}.values())
+
+    if limit > 0 and len(records) > limit:
+        records = records[:limit]
+
+    if mode == 'raise' and os.path.exists(filepath_vecdb):
+        raise FileExistsError(f"file with {filepath_vecdb=} already exists and 'mode' is {mode=}")
+    
+    client = chromadb.PersistentClient(path=filepath_vecdb)
+    collection = client.get_or_create_collection(name=collection_name)
+
+    # Get all existing IDs before adding new data
+    existing_ids = []
+    
+    if mode == 'merge':
+        try:
+            results = collection.get(include=[])
+            existing_ids = results['ids']
+        except Exception as e:
+            print(f"Error retrieving existing IDs: {e}")
+            raise
+
+
+    existing_ids = set(existing_ids)
+    if mode == 'merge':
+        records = [r for r in records if not r['uid'] in existing_ids]
+
+    if not records:
+        print('Nothing to upload...')
+    elif len(records) > 20:
+        for r in tqdm(records, 'records'):
+            collection.add(
+                documents=[r['content']],
+                metadatas=[{k: str(v) for k, v in r.items() if k != 'body'}],
+                ids=[r['uid']],
+            )
+    else:
+        collection.add(
+            documents=[r['content'] for r in records],
+            metadatas=[{k: str(v) for k, v in r.items() if k != 'body'} for r in records],
+            ids=[r['uid'] for r in records],
+        )
+
+
+def main_vecdb_query(query:str, filepath_vecdb:str, collection_name:str, limit:int=10, *args, **kwargs):
+    import chromadb
+
+
+    client = chromadb.PersistentClient(path=filepath_vecdb)
+    collection = client.get_or_create_collection(name=collection_name)
+
+    n_results = max(int(limit), 1)
+
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results,
+        # where={"metadata_field": "is_equal_to_this"}, # optional filter
+        # where_document={"$contains":"search_string"}  # optional filter
+    )
+    
+    n = len(results['documents'][0])
+    records = [{'distance': results['distances'][0][i], 'body': results['documents'][0][i], **results['metadatas'][0][i]} for i in range(n)]
+
+    print(f'got {len(records)=} for {query=}')
+    # print(json.dumps(results, indent=2))
+
+    return records
+        
 
         
     
@@ -732,16 +820,21 @@ def test_config(config):
     if empty_values:
         raise ValueError(f'found {empty_values=} need to either set them permanently, or give them as command line args')
 
-def _peek(records, show_body):
-    i = random.randrange(0, len(records), 1)
-    print(f'Found N={len(records)=} randomly selected index {i=}')
-    print('\n\n' + '§'*100)
-    if show_body:
-        print(records[i]['subject'])
-        print('')
-        print(records[i]['body'])
+def _peek(records, show_body, all=False):
+    if all:
+        ii = range(len(records))
+        print(f'Found N={len(records)=} randomly selected index ALL')
     else:
-        print(json.dumps(records[i], indent=2))
+        ii = [random.randrange(0, len(records), 1)]
+        print(f'Found N={len(records)=} randomly selected index {ii=}')
+    print('\n\n' + '§'*100)
+    for i in ii:
+        if show_body:
+            print(records[i]['subject'])
+            print('')
+            print(records[i].get('body', records[i]['content']))
+        else:
+            print(json.dumps(records[i], indent=2))
     print('\n\n' + '§'*100)
 
 def main():
@@ -765,6 +858,10 @@ def main():
     cnfg_parser.add_argument('--mode', choices= CHOICES_MODE, default=None, help='File handling mode')
     cnfg_parser.add_argument('-r', '--filepath_raw', default=None, help='Output file path')
     cnfg_parser.add_argument('-c', '--filepath_clean', default=None, help='Output file path')
+    cnfg_parser.add_argument('-d', '--filepath_vecdb', default=None, help='Output file path vecdb')
+    cnfg_parser.add_argument('--collection_name', default=None, help='collection_name for vecdb')
+    
+    
 
     cnfg_printer = subparsers.add_parser('config-show', help='show the current config')
     cnfg_printer.add_argument('--dummy', action='store_true', help='dummy argument placeholder')
@@ -797,6 +894,7 @@ def main():
     clean_parser.add_argument('-c', '--filepath_clean', default=config['filepath_clean'], help='Output file path for clean emails')
     clean_parser.add_argument('-p', '--peek', help='whether or not to peek a rendom result after done', action='store_true')
     clean_parser.add_argument('-b', '--body', help='whether or not to only peek subject and body', action='store_true')
+    clean_parser.add_argument('--limit', type=int, default=-1, help='Limit number of emails to fetch (-1 for all)')
 
     peek_raw = subparsers.add_parser('peek-raw', help='show a random email from raw file')
     peek_raw.add_argument('-r', '--filepath_raw', default=config['filepath_raw'], help='Output file path')
@@ -806,13 +904,25 @@ def main():
     peek_clean.add_argument('-r', '--filepath_clean', default=config['filepath_clean'], help='Output file path')
     peek_clean.add_argument('-b', '--body', help='whether or not to only show subject and body', action='store_true')
 
-
+    vec_parser = subparsers.add_parser('vec-make', help='upload clean records to vector_db (using chroma)')
+    vec_parser.add_argument('--mode', choices=CHOICES_MODE, default=config['mode'], help='File handling mode')
+    vec_parser.add_argument('-c', '--filepath_clean', default=config['filepath_clean'], help='Input file path for clean emails')
+    vec_parser.add_argument('-d', '--filepath_vecdb', default=config['filepath_vecdb'], help='Output file path for vectordb')
+    vec_parser.add_argument('--limit', type=int, default=-1, help='Limit number of emails to fetch (-1 for all)')
+    vec_parser.add_argument('--collection_name', default=config['collection_name'], help='collection_name for vecdb')
+    
+    vec_query = subparsers.add_parser('vec-query', help='query teh vector_db for a search string (using chroma)')
+    vec_query.add_argument('-q', '--query', required=True, help='The Query')
+    vec_query.add_argument('-d', '--filepath_vecdb', default=config['filepath_vecdb'], help='Output file path for vectordb')
+    vec_query.add_argument('--limit', type=int, default=10, help='Limit number of emails to fetch')
+    vec_query.add_argument('--collection_name', default=config['collection_name'], help='collection_name for vecdb')
+    vec_query.add_argument('-b', '--body', help='whether or not to only show subject and body', action='store_true')
     args = parser.parse_args()    
     d = vars(args)
 
     # Execute appropriate function
     if args.command == 'download':
-        config.update({k:v for k, v in d.items() if v})
+        config.update({k:v for k, v in d.items() if v and k != "command"})
         
         if not config.get('password', ''):
             config['password'] = getpass.getpass(f'Enter Email password for {config["email"]} @ {config["server"]}: ')
@@ -823,13 +933,22 @@ def main():
             print('='*20)
             _peek(records, args.body)
     elif args.command == 'clean':
-        config.update({k:v for k, v in d.items() if v})
+        config.update({k:v for k, v in d.items() if v and k != "command"})
         test_config(config)
         records = main_get_clean(**config)
         if args.peek:
             print('='*20)
             _peek(records, args.body)
-
+    elif args.command == 'vec-make':
+        config.update({k:v for k, v in d.items() if v and k != "command"})
+        test_config(config)
+        records = main_vecdb(**config)
+    elif args.command == 'vec-query':
+        config.update({k:v for k, v in d.items() if v and k != "command"})
+        records = main_vecdb_query(**config)
+        print('='*20)
+        _peek(records, args.body, all=True)
+        
     elif args.command == 'config-show':
         print('='*20)
         print(f'Content for {CONFIG_FILE=} (file_exists={os.path.exists(CONFIG_FILE)})')
@@ -837,7 +956,7 @@ def main():
         print(json.dumps(config, indent=2))
         print('='*20)
     elif args.command == 'config-set':
-        config.update({k:v for k, v in d.items() if v})
+        config.update({k:v for k, v in d.items() if v and k != "command"})
         print(f'saving new config to {CONFIG_FILE=}')
         save_config(config)
     elif args.command == 'config-clear':
@@ -848,7 +967,7 @@ def main():
         print(f'saving default config to {CONFIG_FILE=}')
         save_config(DEFAULT_CONFIG)
     elif args.command == 'peek-raw':
-        config.update({k:v for k, v in d.items() if v})
+        config.update({k:v for k, v in d.items() if v and k != "command"})
         test_config(config)
         filepath_raw = config["filepath_raw"]
         print('='*20)
@@ -857,7 +976,7 @@ def main():
         _peek(records, args.body)
         print('='*20)
     elif args.command == 'peek-clean':
-        config.update({k:v for k, v in d.items() if v})
+        config.update({k:v for k, v in d.items() if v and k != "command"})
         test_config(config)
         filepath_clean = config["filepath_clean"]
         print('='*20)
