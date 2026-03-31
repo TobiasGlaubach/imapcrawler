@@ -1,0 +1,5 @@
+cd into my folder
+
+python -m build
+
+twine upload dist/*

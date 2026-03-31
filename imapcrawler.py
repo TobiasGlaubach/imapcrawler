@@ -15,6 +15,7 @@ import os
 import getpass
 from datetime import timedelta, datetime, timezone
 import random
+import secrets
 import time
 import warnings
 # import dateparser
@@ -523,7 +524,7 @@ def is_valid_attachment(attachment):
 #     return body
 
 
-def clean_record(record):
+def clean_record(record, nice_id=True):
     body_parts = record.get("body", ["text/plain", "NO_EMAIL_BODY"])
     
     body = ''
@@ -556,33 +557,34 @@ def clean_record(record):
     
     if body.strip().startswith('Updated invitation: '):
         return {}
-    
+    fun = lambda x: ','.join(x) if isinstance(x, list) else str(x)
+
+    if nice_id:
+        sub = record['subject']
+        if len(sub) > 100:
+            sub = sub[:97] + '...'
+        
+        uid = f'{record["date_iso"]}>>{sub}>>{secrets.token_hex(2)}'
+    else:
+        uid = record['uid']
     # Update the record
-    cleaned_record = copy.deepcopy(record)
+    cleaned_record = {
+        'content': body.strip(),
+        'id': uid,
+        'meta': {k:fun(v) for k, v in record.items() if k != 'body'}
+    }
 
-    cleaned_record["content"] = body.strip()
-    cleaned_record.pop('body')
-
-    # Optimize list to string conversion
-    for k in ['to_list', 'cc_list', 'bcc_list']:
-        if isinstance(cleaned_record[k], list):
-            cleaned_record[k] = ','.join(cleaned_record[k])
-    
-    
-    # attachments = [str(a['filename']) for a in cleaned_record['attachments'] if is_valid_attachment(a)]
-    # cleaned_record['attachments'] = ', '.join(attachments)
-    
     return cleaned_record
 
 
-def main_get_raw(email, password=None, date=None, month=None, limit=-1, mode='merge', filepath_raw='emails_raw.jsonl', diff=False, **kwargs):
+def main_get_raw(server, email, password=None, date=None, month=None, limit=-1, mode='merge', filepath_raw='emails_raw.jsonl', diff=False, **kwargs):
 
     if password is None:
         password = getpass.getpass('Enter Email password')
 
     print('connecting...')
     # Connect and fetch emails
-    mail = connect_imap('imap.mpifr-bonn.mpg.de', email, password)
+    mail = connect_imap(server, email, password)
     
     print('getting emails...')
     if date is None and month is None:
@@ -664,7 +666,7 @@ def main_get_raw(email, password=None, date=None, month=None, limit=-1, mode='me
     return records
 
 
-def main_get_clean(mode='merge', filepath_clean='emails.jsonl', filepath_raw='emails_raw.jsonl', limit=-1, **kwargs):
+def main_get_clean(mode='merge', filepath_clean='emails.jsonl', filepath_raw='emails_raw.jsonl', limit=-1, collection_name='', **kwargs):
     
     print(f'reading from {filepath_raw=}')
     records = read_records_jsonlines(filepath_raw)

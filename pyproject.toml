@@ -4,14 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "imapcrawler"
-version = "0.1.2"
+version = "0.1.3"
 description = "A Python tool to crawl an IMAP inbox and extract emails as structured records"
 readme = "README.md"
 authors = [{name = "Your Name", email = "your.email@example.com"}]
-license = {text = "MIT"}
+license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 keywords = ["imap", "email", "crawler", "email-analysis"]
@@ -23,7 +22,8 @@ all = [
     "beautifulsoup4",
     "python-dateutil",
     "mail-parser-reply",
-    "chromadb"
+    "chromadb",
+    "requests"
 ]
 
 [project.urls]
